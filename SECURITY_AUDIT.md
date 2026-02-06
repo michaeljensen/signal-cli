@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-06
 **Scope:** Full codebase review of signal-cli (src/ and lib/ — 407 Java source files)
-**Methodology:** Static analysis across 7 categories: hardcoded secrets, data leakage, backdoors, cryptography, injection, network security, and input validation
+**Methodology:** Two-pass static analysis across 8 categories: hardcoded secrets, data leakage, backdoors, cryptography, injection, network security, input validation, and deep-dive (obfuscation, supply chain, covert channels)
 
 ---
 
@@ -19,9 +19,10 @@ However, the audit identified several security gaps in data-at-rest protection, 
 | Severity | Count | Key Themes |
 |----------|-------|------------|
 | **CRITICAL** | 3 | Log scrubbing off by default; account secrets in plaintext JSON; JSON-RPC input logged at TRACE |
-| **HIGH** | 5 | No HTTP/TCP daemon auth; phone numbers logged in plaintext; temp files in world-readable `/tmp`; no encryption-at-rest for stored data |
-| **MEDIUM** | 7 | Path traversal in attachment retrieval; D-Bus arbitrary file read; no request size limits; no CORS; incomplete scrubber coverage |
-| **LOW** | 9 | Informational items, minor TODOs, benign toString() methods |
+| **HIGH** | 6 | No HTTP/TCP daemon auth; unofficial core crypto library; phone numbers logged in plaintext; temp files in world-readable `/tmp`; no encryption-at-rest |
+| **MEDIUM** | 11 | Path traversal; D-Bus arbitrary file read; no request size limits; no CORS; incomplete scrubber; no dependency verification; Gradle wrapper missing SHA-256; libsignal override property; CI write permissions |
+| **LOW** | 12 | Fat JAR strips signatures; GH Actions pinned to tags; native access flag; informational items, minor TODOs |
+| **CLEAN** | 4 areas | No obfuscated secrets; no hidden backdoors; no covert data channels; repository matches upstream |
 
 ---
 
@@ -248,6 +249,106 @@ The Unix socket mode is the most secure local interface — directory created wi
 
 ---
 
+## Category 8: Deep Dive — Obfuscation, Supply Chain, and Covert Channels
+
+*Second-pass analysis specifically hunting for obfuscated secrets, hidden backdoors, and subtle data exfiltration.*
+
+### Obfuscated Secrets: CLEAN
+
+| Technique | Result |
+|-----------|--------|
+| **All Base64 literals decoded** | Every Base64 string in `LiveConfig.java` and `StagingConfig.java` decodes to binary cryptographic material (33-byte EC public keys, zkgroup params, backup server params). None decode to ASCII text, URLs, credentials, or instructions. |
+| **Hex strings decoded** | Only MRENCLAVE values (SGX enclave measurements): `0f6fd79c...` (CDSI), `29cd63c8...` (SVR2 live), `a75542d8...` (SVR2 staging). Public Intel SGX measurements, not secrets. |
+| **Char/byte array construction** | No `new char[]{}`, `new byte[]{}` with literal values, or `String.valueOf(new char[]{...})` patterns found anywhere. |
+| **Piecewise string building** | All `StringBuilder`/`StringBuffer` usage is for log scrubbing, hex encoding, and error messages. No strings assembled to form secrets or URLs. |
+| **XOR/bitwise on strings** | Only standard hex encoding bit shifts in `Hex.java:35`. No XOR decoding of hidden data. |
+| **Resource file secrets** | `whisper.store` contains exactly 2 X.509 certificates (TextSecure CA + Signal Messenger CA). `META-INF/services/` contains only a Logback configurator class name. No embedded credentials. |
+| **Unicode tricks** | No zero-width characters, homoglyphs, RTL overrides, or BOM characters in any source file. |
+| **Custom annotations** | No custom annotations (`@interface`) defined anywhere in the codebase. |
+
+### Hidden Backdoors: CLEAN
+
+| Technique | Result |
+|-----------|--------|
+| **Date/time bombs** | No `LocalDate`, `Calendar`, year/month/day comparisons, or time-based conditional logic. |
+| **Magic phone numbers/UUIDs** | No hardcoded phone numbers or UUIDs in conditional logic. |
+| **Hidden env vars** | Only 4 env vars read: `SIGNAL_CLI_USER_AGENT`, `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, `GRAALVM_HOME` (build-time). None enable hidden functionality. |
+| **Reflection** | Zero instances of `Class.forName()`, `Method.invoke()`, `getDeclaredMethod()`, `newInstance()`, `Proxy.newProxyInstance()`. The only `getMethod()` hits are JSON-RPC method-name getters. |
+| **ClassLoader manipulation** | No `URLClassLoader`, `defineClass`, `loadClass`, or custom ClassLoaders. |
+| **Hidden threads** | All thread creation is for documented functionality: HTTP server, JSON-RPC, socket handler, WebSocket health monitor, job executor. No unexplained threads. |
+| **Native code/JNI** | No `System.loadLibrary()` or `System.load()` in signal-cli's own source. `libsignal-client` JNI is a transitive dependency. |
+| **Hidden network listeners** | All `ServerSocketChannel` instances are in `IOUtils.java:130-136` (user-requested via `--tcp`/`--socket`) and `DaemonCommand.java:157` (systemd socket activation). No hidden listeners. |
+| **File watchers** | No `WatchService`, `FileObserver`, or `inotify` usage. |
+| **Serialization gadgets** | No `readObject`, `readResolve`, `writeReplace`, `readExternal`, or `ObjectInputStream`. Jackson polymorphic typing (`enableDefaultTyping`, `JsonTypeInfo`) not used. |
+| **Process execution** | The only `Runtime.getRuntime()` call is for a shutdown hook in `Shutdown.java:26`. Zero instances of `ProcessBuilder`. |
+
+### Covert Data Channels: CLEAN
+
+| Technique | Result |
+|-----------|--------|
+| **DNS exfiltration** | No dynamic hostname construction from data. DNS is default OkHttp (`Optional<Dns> dns = Optional.empty()`). |
+| **HTTP header exfil** | Only custom header is `User-Agent`. No data from messages, keys, or phone numbers in any HTTP header. |
+| **Steganography** | No `BufferedImage`, `ImageIO`, pixel manipulation, or data embedding in attachments. |
+| **Timing side channels** | Two instances of `Arrays.equals()` on crypto material (`GroupV2Helper.java:423`, `IdentityHelper.java:34`), but both are local comparisons for data freshness — not authentication or MAC verification. Not exploitable as timing oracles. |
+| **Error-based exfil** | No intentional exception throwing that encodes data. Standard error patterns only. |
+
+### Supply Chain Risks
+
+#### HIGH: Unofficial Signal Protocol Library
+
+**File:** `gradle/libs.versions.toml:14`
+```
+signalservice = "com.github.turasa:signal-service-java:2.15.3_unofficial_137"
+```
+
+The **most security-critical dependency** (handles all encryption, key exchange, message sending/receiving) comes from `com.github.turasa` — a personal GitHub fork, not the official Signal organization (`org.signal`). The version string `2.15.3_unofficial_137` explicitly marks it as unofficial. Signal does not publish `signal-service-java` as a standalone Maven artifact, so this fork is necessary for signal-cli to exist, but it means the core cryptographic code cannot be verified against an official Signal release without manual diff.
+
+#### MEDIUM: No Gradle Dependency Verification
+
+No `gradle/verification-metadata.xml` exists. Downloaded dependency checksums and PGP signatures are not validated. Combined with `mavenLocal()` in the repository list (`settings.gradle.kts:4`), an attacker with write access to `~/.m2/repository/` could substitute any dependency.
+
+#### MEDIUM: Gradle Wrapper Missing SHA-256 Checksum
+
+**File:** `gradle/wrapper/gradle-wrapper.properties`
+
+The `distributionSha256Sum` property is not set, meaning the Gradle distribution ZIP is downloaded without checksum verification. However, the wrapper JAR itself was verified: SHA-256 `b3a875ddc1f044746e1b1a55f645584505f4a10438c1afea9f15e92a7c42ec13` matches the official Gradle 9.3.0 release.
+
+#### MEDIUM: libsignal-client Override Build Property
+
+**File:** `lib/build.gradle.kts:17-27`
+
+The `libsignal_client_path` Gradle property allows substituting the core crypto library with an arbitrary local JAR via `-Plibsignal_client_path=/path/to/jar`. Developer convenience feature that widens the attack surface on build systems.
+
+#### MEDIUM: CI Workflow Has `contents: write` on All Branches
+
+**File:** `.github/workflows/ci.yml:11`
+
+The CI workflow grants write access to repository contents for all push/PR events, including pull requests from forks.
+
+#### LOW: Fat JAR Strips Dependency Signatures
+
+**File:** `build.gradle.kts:126-128`
+
+The `fatJar` task removes `META-INF/*.SF`, `*.DSA`, `*.RSA` signature files from dependencies. Standard for uber JARs, but means individual dependency integrity cannot be verified after packaging.
+
+#### LOW: GitHub Actions Pinned to Major Version Tags
+
+**File:** `.github/workflows/ci.yml:23-29`
+
+`actions/checkout@v4`, `actions/setup-java@v3`, etc. are pinned to major tags instead of commit SHAs. A compromised tag could be moved to point to malicious code.
+
+#### LOW: `--enable-native-access=ALL-UNNAMED` JVM Flag
+
+**File:** `build.gradle.kts:27`
+
+Grants unrestricted native memory access to all unnamed modules. Required by `libsignal-client`'s JNI, but widens the attack surface if any dependency is compromised.
+
+### Repository Integrity: VERIFIED
+
+This repository is an **unmodified fork of upstream AsamK/signal-cli** (version 0.13.24 / 0.14.0-SNAPSHOT). The only non-upstream addition is this `SECURITY_AUDIT.md` file. All 46 upstream commits are from `AsamK <asamk@gmx.de>` (the official maintainer) plus standard community contributions. No source code, build files, or configuration has been modified from upstream.
+
+---
+
 ## Top Recommendations (Priority Order)
 
 1. **Enable log scrubbing by default** — The `--scrub-log` flag should be on by default, with a `--no-scrub-log` to disable.
@@ -260,3 +361,6 @@ The Unix socket mode is the most secure local interface — directory created wi
 8. **Extend the Scrubber** to cover message content, cryptographic keys, and file paths.
 9. **Remove internal class names from error responses** — Don't expose `e.getClass().getSimpleName()` to D-Bus/JSON-RPC clients.
 10. **Add CORS headers** to the HTTP server to prevent browser-based CSRF.
+11. **Add Gradle dependency verification** (`verification-metadata.xml`) and remove `mavenLocal()` from production builds.
+12. **Add `distributionSha256Sum`** to `gradle-wrapper.properties`.
+13. **Pin GitHub Actions to commit SHAs** instead of mutable version tags.
